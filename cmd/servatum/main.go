@@ -24,6 +24,7 @@ import (
 
 	"github.com/servatum-io/servatum-cli/internal/api"
 	"github.com/servatum-io/servatum-cli/internal/runner"
+	"github.com/servatum-io/servatum-cli/internal/spool"
 )
 
 var version = "0.1.0-dev"
@@ -42,6 +43,8 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 		return cmdRun(args[1:], stdout, stderr)
 	case "ping":
 		return cmdPing(args[1:], stderr)
+	case "flush":
+		return cmdFlush(args[1:], stderr)
 	case "version", "--version", "-v":
 		fmt.Fprintln(stdout, "servatum", version)
 		return 0
@@ -58,9 +61,10 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
   servatum run  --job job_… [flags] -- <command> [args…]
   servatum ping [--start|--fail] [--log FILE|-] <ping_token>
+  servatum flush                 send reports spooled while Servatum was unreachable
   servatum version
 
-Environment: SERVATUM_KEY (ingest key), SERVATUM_JOB, SERVATUM_ENDPOINT
+Environment: SERVATUM_KEY (ingest key), SERVATUM_JOB, SERVATUM_ENDPOINT, SERVATUM_SPOOL
 Run "servatum run -h" or "servatum ping -h" for flags.
 `)
 }
@@ -109,15 +113,32 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, string(b))
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		resp, err := client.PostRun(ctx, r)
-		if err != nil {
-			// C2 spools here. Until then: warn, never fail the backup.
-			logf("WARNING could not report %s for %s: %v", r.Status, r.Job, err)
+		var resp *api.RunResponse
+		err := api.Retry(ctx, func(c context.Context) error {
+			var e error
+			resp, e = client.PostRun(c, r)
+			return e
+		})
+		if err == nil {
+			logf("reported %s for %s (run %s, state %s)", r.Status, r.Job, orDash(resp.RunID), orDash(resp.State))
 			return
 		}
-		logf("reported %s for %s (run %s, state %s)", r.Status, r.Job, orDash(resp.RunID), orDash(resp.State))
+		if !api.IsTransient(err) {
+			logf("WARNING report %s for %s rejected, not retried: %v", r.Status, r.Job, err)
+			return
+		}
+		if r.Status == api.StatusStarted {
+			// A late "started" says nothing the final report won't; don't spool it.
+			logf("WARNING could not report started for %s: %v", r.Job, err)
+			return
+		}
+		if path, serr := spool.Save(spool.Dir(), spool.KeyID(client.Key), r, time.Now()); serr == nil {
+			logf("WARNING could not reach Servatum (%v); report spooled to %s, retried for 72 h", err, path)
+		} else {
+			logf("WARNING could not report %s for %s: %v (spool failed: %v)", r.Status, r.Job, err, serr)
+		}
 	}
 
 	host, _ := os.Hostname()
@@ -135,6 +156,9 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 	}
 	canSend := *dry || (*key != "" && *job != "")
 
+	if canSend && !*dry {
+		flushSpool(client, logf, 10*time.Second)
+	}
 	if !*noStart && canSend {
 		send(api.Run{Job: *job, Status: api.StatusStarted, StartedAt: ts(start), IdempotencyKey: base + "-start"})
 	}
@@ -218,7 +242,8 @@ func cmdPing(args []string, stderr io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if err := api.New(*endpoint, "", version).Ping(ctx, fs.Arg(0), status, log); err != nil {
+	pc := api.New(*endpoint, "", version)
+	if err := api.Retry(ctx, func(c context.Context) error { return pc.Ping(c, fs.Arg(0), status, log) }); err != nil {
 		fmt.Fprintln(stderr, "servatum ping:", err)
 		var ae *api.APIError
 		if errors.As(err, &ae) && !ae.Retryable() {
@@ -259,4 +284,54 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// flushSpool sends spooled reports, best effort, within budget.
+func flushSpool(client *api.Client, logf func(string, ...any), budget time.Duration) spool.Result {
+	dir := spool.Dir()
+	res, err := spool.Flush(dir, spool.KeyID(client.Key), time.Now(), time.Now().Add(budget), func(r api.Run) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, e := client.PostRun(ctx, r)
+		return e
+	})
+	if res.Sent+res.Expired+res.Rejected > 0 || err != nil {
+		logf("spool %s: sent %d, expired %d, rejected %d, left %d", dir, res.Sent, res.Expired, res.Rejected, res.Left)
+	}
+	if err != nil {
+		logf("WARNING spool flush stopped: %v", err)
+	}
+	return res
+}
+
+func cmdFlush(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("flush", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	key := fs.String("key", "", "ingest key; default $SERVATUM_KEY")
+	endpoint := fs.String("endpoint", envOr("SERVATUM_ENDPOINT", api.DefaultEndpoint), "API base URL")
+	quiet := fs.Bool("quiet", false, "only print problems")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *key == "" {
+		*key = os.Getenv("SERVATUM_KEY")
+	}
+	if *key == "" {
+		fmt.Fprintln(stderr, "servatum flush: no ingest key (SERVATUM_KEY)")
+		return 2
+	}
+	logf := func(format string, a ...any) {
+		if !*quiet || strings.HasPrefix(format, "WARNING") {
+			fmt.Fprintf(stderr, "servatum: "+format+"\n", a...)
+		}
+	}
+	res := flushSpool(api.New(*endpoint, *key, version), logf, 60*time.Second)
+	if res.Locked {
+		logf("another flush is running")
+		return 0
+	}
+	if res.Left > 0 {
+		return 1
+	}
+	return 0
 }

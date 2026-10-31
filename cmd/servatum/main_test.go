@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/servatum-io/servatum-cli/internal/api"
 	"github.com/servatum-io/servatum-cli/internal/mockapi"
 )
 
@@ -19,7 +22,14 @@ func setup(t *testing.T) (*mockapi.Server, string) {
 	t.Setenv("SERVATUM_KEY", "sv_ing_test")
 	t.Setenv("SERVATUM_ENDPOINT", srv.URL)
 	t.Setenv("SERVATUM_JOB", "")
+	t.Setenv("SERVATUM_SPOOL", t.TempDir())
+	api.RetryDelays = []time.Duration{0, 0}
 	return m, srv.URL
+}
+
+func spooled(t *testing.T) int {
+	es, _ := filepath.Glob(filepath.Join(os.Getenv("SERVATUM_SPOOL"), "*.json"))
+	return len(es)
 }
 
 func run(args ...string) (int, string, string) {
@@ -79,7 +89,7 @@ func TestRunAPIDownStillReturnsCommandCode(t *testing.T) {
 	setup(t)
 	t.Setenv("SERVATUM_ENDPOINT", "http://127.0.0.1:1")
 	code, out, errS := run("run", "--job", "job_1", "--", "sh", "-c", "echo data; exit 0")
-	if code != 0 || !strings.Contains(out, "data") || !strings.Contains(errS, "WARNING could not report") {
+	if code != 0 || !strings.Contains(out, "data") || !strings.Contains(errS, "spooled") {
 		t.Fatalf("code=%d out=%q err=%q", code, out, errS)
 	}
 }
@@ -173,5 +183,87 @@ func TestRunOutputNotSentByDefault(t *testing.T) {
 	}
 	if msg, ok := runs[0]["message"]; ok && msg != "" {
 		t.Fatalf("output leaked into report: %v", msg)
+	}
+}
+
+func TestRetryThenDeliver(t *testing.T) {
+	m, _ := setup(t)
+	m.FailNext = 2 // two 503s, third attempt succeeds
+	code, _, _ := run("run", "--job", "job_1", "--no-start", "--", "true")
+	runs, _ := m.Snapshot()
+	if code != 0 || len(runs) != 1 || spooled(t) != 0 {
+		t.Fatalf("code=%d runs=%d spooled=%d", code, len(runs), spooled(t))
+	}
+}
+
+func TestSpoolWhenDownThenFlushOnNextRun(t *testing.T) {
+	m, _ := setup(t)
+	m.FailNext = 3 // all inline attempts fail
+	code, _, errS := run("run", "--job", "job_1", "--no-start", "--", "sh", "-c", "exit 4")
+	if code != 4 || spooled(t) != 1 || !strings.Contains(errS, "spooled") {
+		t.Fatalf("code=%d spooled=%d err=%q", code, spooled(t), errS)
+	}
+	// next run: spooled report goes first, then the new one
+	run("run", "--job", "job_1", "--no-start", "--", "true")
+	runs, _ := m.Snapshot()
+	if spooled(t) != 0 || len(runs) != 2 || runs[0]["status"] != "fail" || runs[1]["status"] != "ok" {
+		t.Fatalf("spooled=%d runs=%v", spooled(t), runs)
+	}
+}
+
+func TestFlushCommandAndIdempotency(t *testing.T) {
+	m, _ := setup(t)
+	m.FailNext = 3
+	run("run", "--job", "job_1", "--no-start", "--idempotency-key", "k9", "--", "true")
+	if c, _, e := run("flush"); c != 0 {
+		t.Fatalf("flush code=%d err=%q", c, e)
+	}
+	if c, _, _ := run("flush"); c != 0 { // nothing left, still fine
+		t.Fatal("second flush failed")
+	}
+	runs, _ := m.Snapshot()
+	if len(runs) != 1 || spooled(t) != 0 {
+		t.Fatalf("runs=%d spooled=%d", len(runs), spooled(t))
+	}
+}
+
+func TestBadKeyNotSpooled(t *testing.T) {
+	setup(t)
+	t.Setenv("SERVATUM_KEY", "sv_ing_wrong")
+	run("run", "--job", "job_1", "--no-start", "--", "true")
+	if spooled(t) != 0 {
+		t.Fatalf("401 must not be spooled, got %d", spooled(t))
+	}
+}
+
+func TestOtherKeysReportsLeftAlone(t *testing.T) {
+	m, _ := setup(t)
+	m.Keys["sv_ing_other"] = true
+	m.FailNext = 3
+	run("run", "--job", "job_1", "--no-start", "--", "true") // spooled under sv_ing_test
+	t.Setenv("SERVATUM_KEY", "sv_ing_other")
+	run("flush")
+	if spooled(t) != 1 {
+		t.Fatalf("report of another key was touched: spooled=%d", spooled(t))
+	}
+}
+
+func TestPingNeverSpooled(t *testing.T) {
+	m, _ := setup(t)
+	m.FailNext = 3
+	if c, _, _ := run("ping", "pt_test"); c != 1 {
+		t.Fatalf("ping code=%d", c)
+	}
+	if spooled(t) != 0 {
+		t.Fatal("ping was spooled")
+	}
+}
+
+func TestStartedNotSpooled(t *testing.T) {
+	setup(t)
+	t.Setenv("SERVATUM_ENDPOINT", "http://127.0.0.1:1")
+	run("run", "--job", "job_1", "--", "true")
+	if spooled(t) != 1 { // only the final report
+		t.Fatalf("spooled=%d, want 1", spooled(t))
 	}
 }

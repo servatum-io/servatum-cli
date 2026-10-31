@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -100,10 +101,10 @@ func (e *APIError) Retryable() bool {
 // body stays under MaxBody.
 func (c *Client) PostRun(ctx context.Context, r Run) (*RunResponse, error) {
 	if c.Key == "" {
-		return nil, fmt.Errorf("no ingest key: set SERVATUM_KEY or --key")
+		return nil, &ConfigError{"no ingest key: set SERVATUM_KEY or --key"}
 	}
 	if r.Job == "" {
-		return nil, fmt.Errorf("no job: set SERVATUM_JOB or --job")
+		return nil, &ConfigError{"no job: set SERVATUM_JOB or --job"}
 	}
 	body, err := fitBody(r)
 	if err != nil {
@@ -134,7 +135,7 @@ func (c *Client) PostRun(ctx context.Context, r Run) (*RunResponse, error) {
 // A non-empty log is POSTed as the body (max MaxPingBody, tail kept).
 func (c *Client) Ping(ctx context.Context, token, status, log string) error {
 	if token == "" {
-		return fmt.Errorf("no ping token")
+		return &ConfigError{"no ping token"}
 	}
 	url := c.Endpoint + "/p/" + token
 	if status != "" {
@@ -200,4 +201,45 @@ func tail(s string, n int) string {
 		cut++
 	}
 	return mark + s[cut:]
+}
+
+// IsTransient reports whether err may clear up on its own (network trouble,
+// 429, 5xx). A 4xx answer means the report itself or the config is wrong.
+func IsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return ae.Retryable()
+	}
+	var ce *ConfigError
+	return !errors.As(err, &ce)
+}
+
+// ConfigError is a local problem (no key, no job): never retried or spooled.
+type ConfigError struct{ msg string }
+
+func (e *ConfigError) Error() string { return e.msg }
+
+// RetryDelays are the waits between inline attempts (~10 s worst case with
+// the 15 s client timeout capped by the caller's context).
+var RetryDelays = []time.Duration{1 * time.Second, 3 * time.Second}
+
+// Retry runs fn up to len(RetryDelays)+1 times while the error is transient
+// and ctx has time left.
+func Retry(ctx context.Context, fn func(context.Context) error) error {
+	err := fn(ctx)
+	for _, d := range RetryDelays {
+		if err == nil || !IsTransient(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(d):
+		}
+		err = fn(ctx)
+	}
+	return err
 }
