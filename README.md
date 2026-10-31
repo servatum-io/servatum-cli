@@ -25,3 +25,15 @@ make test
 go run ./cmd/mockapi            # local stand-in API on :8787, GET /_dump to inspect
 make build                      # static linux amd64/arm64 binaries in dist/
 ```
+
+## Hooks (`hooks/`)
+
+Generic POSIX `sh` scripts for Linux servers. Key goes in `/etc/servatum/env` (`SERVATUM_KEY=sv_ing_...`, mode 600). Each exits 0 so a reporting problem never breaks the backup tool (`SERVATUM_HOOK_STRICT=1` to change that).
+
+| Script | Use when | Example |
+|---|---|---|
+| `post-hook.sh <job> <status\|exit_code> [msg]` | the backup tool can run a script after a job | `post-hook.sh job_x "$EXIT_CODE"` |
+| `cron-wrap.sh <job> <cmd...>` | the backup is a cron line | `0 1 * * * cron-wrap.sh job_x /usr/local/bin/backup.sh` |
+| `log-check.sh <job> <log> [--ok RE] [--fail RE] [--max-age MIN]` | the tool only writes a log | `30 6 * * * log-check.sh job_x /var/log/backup.log` |
+
+`servatum report --job … --status ok|warn|fail [--exit-code N] [--message …]` is what the hooks call; use it directly from any script.

@@ -43,6 +43,8 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 		return cmdRun(args[1:], stdout, stderr)
 	case "ping":
 		return cmdPing(args[1:], stderr)
+	case "report":
+		return cmdReport(args[1:], stderr)
 	case "flush":
 		return cmdFlush(args[1:], stderr)
 	case "version", "--version", "-v":
@@ -61,6 +63,7 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
   servatum run  --job job_… [flags] -- <command> [args…]
   servatum ping [--start|--fail] [--log FILE|-] <ping_token>
+  servatum report --job job_… --status ok|warn|fail [--message …]
   servatum flush                 send reports spooled while Servatum was unreachable
   servatum version
 
@@ -107,39 +110,7 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	client := api.New(*endpoint, *key, version)
-	send := func(r api.Run) {
-		if *dry {
-			b, _ := json.MarshalIndent(r, "", "  ")
-			fmt.Fprintln(stderr, string(b))
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		var resp *api.RunResponse
-		err := api.Retry(ctx, func(c context.Context) error {
-			var e error
-			resp, e = client.PostRun(c, r)
-			return e
-		})
-		if err == nil {
-			logf("reported %s for %s (run %s, state %s)", r.Status, r.Job, orDash(resp.RunID), orDash(resp.State))
-			return
-		}
-		if !api.IsTransient(err) {
-			logf("WARNING report %s for %s rejected, not retried: %v", r.Status, r.Job, err)
-			return
-		}
-		if r.Status == api.StatusStarted {
-			// A late "started" says nothing the final report won't; don't spool it.
-			logf("WARNING could not report started for %s: %v", r.Job, err)
-			return
-		}
-		if path, serr := spool.Save(spool.Dir(), spool.KeyID(client.Key), r, time.Now()); serr == nil {
-			logf("WARNING could not reach Servatum (%v); report spooled to %s, retried for 72 h", err, path)
-		} else {
-			logf("WARNING could not report %s for %s: %v (spool failed: %v)", r.Status, r.Job, err, serr)
-		}
-	}
+	send := func(r api.Run) { deliver(client, r, *dry, stderr, logf) }
 
 	host, _ := os.Hostname()
 	start := time.Now().UTC()
@@ -334,4 +305,110 @@ func cmdFlush(args []string, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// deliver sends one run report with retries; on a transient failure it is
+// spooled (except "started"). Result: 0 delivered/spooled/dry-run,
+// 3 rejected by the API (bad key/job: fix config), 1 could not deliver or spool.
+func deliver(client *api.Client, r api.Run, dry bool, stderr io.Writer, logf func(string, ...any)) int {
+	if dry {
+		b, _ := json.MarshalIndent(r, "", "  ")
+		fmt.Fprintln(stderr, string(b))
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var resp *api.RunResponse
+	err := api.Retry(ctx, func(c context.Context) error {
+		var e error
+		resp, e = client.PostRun(c, r)
+		return e
+	})
+	if err == nil {
+		logf("reported %s for %s (run %s, state %s)", r.Status, r.Job, orDash(resp.RunID), orDash(resp.State))
+		return 0
+	}
+	if !api.IsTransient(err) {
+		logf("WARNING report %s for %s rejected, not retried: %v", r.Status, r.Job, err)
+		return 3
+	}
+	if r.Status == api.StatusStarted {
+		// A late "started" says nothing the final report won't; don't spool it.
+		logf("WARNING could not report started for %s: %v", r.Job, err)
+		return 1
+	}
+	path, serr := spool.Save(spool.Dir(), spool.KeyID(client.Key), r, time.Now())
+	if serr != nil {
+		logf("WARNING could not report %s for %s: %v (spool failed: %v)", r.Status, r.Job, err, serr)
+		return 1
+	}
+	logf("WARNING could not reach Servatum (%v); report spooled to %s, retried for 72 h", err, path)
+	return 0
+}
+
+func cmdReport(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	job := fs.String("job", os.Getenv("SERVATUM_JOB"), "job ID (job_…); default $SERVATUM_JOB")
+	key := fs.String("key", "", "ingest key; default $SERVATUM_KEY")
+	endpoint := fs.String("endpoint", envOr("SERVATUM_ENDPOINT", api.DefaultEndpoint), "API base URL")
+	status := fs.String("status", "", "ok | warn | fail (required)")
+	exitCode := fs.Int("exit-code", -1, "exit code to record, if any")
+	started := fs.String("started-at", "", "RFC 3339 start time, if known")
+	finished := fs.String("finished-at", "", "RFC 3339 finish time; default now")
+	message := fs.String("message", "", "short message (no secrets, paths only if you want them stored)")
+	size := fs.Int64("size-bytes", 0, "backup size in bytes, if known")
+	snapshot := fs.String("snapshot-id", "", "snapshot / archive ID, if known")
+	idem := fs.String("idempotency-key", "", "idempotency key; default derived from job, host and finish time")
+	dry := fs.Bool("dry-run", false, "print the report instead of sending it")
+	quiet := fs.Bool("quiet", false, "only print problems")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *key == "" {
+		*key = os.Getenv("SERVATUM_KEY")
+	}
+	switch *status {
+	case api.StatusOK, api.StatusWarn, api.StatusFail:
+	default:
+		fmt.Fprintln(stderr, "servatum report: --status must be ok, warn or fail")
+		return 2
+	}
+	for _, t := range []string{*started, *finished} {
+		if t != "" {
+			if _, err := time.Parse(time.RFC3339, t); err != nil {
+				fmt.Fprintf(stderr, "servatum report: bad time %q (want RFC 3339)\n", t)
+				return 2
+			}
+		}
+	}
+	if !*dry && (*key == "" || *job == "") {
+		fmt.Fprintln(stderr, "servatum report: need SERVATUM_KEY and --job (or SERVATUM_JOB)")
+		return 2
+	}
+	now := time.Now().UTC()
+	fin := *finished
+	if fin == "" {
+		fin = ts(now)
+	}
+	if *idem == "" {
+		host, _ := os.Hostname()
+		*idem = fmt.Sprintf("%s-%s-%d", *job, host, now.UnixNano())
+	}
+	r := api.Run{Job: *job, Status: *status, StartedAt: *started, FinishedAt: fin, Message: *message,
+		SizeBytes: *size, SnapshotID: *snapshot, IdempotencyKey: *idem}
+	if *exitCode >= 0 {
+		c := *exitCode
+		r.ExitCode = &c
+	}
+	logf := func(format string, a ...any) {
+		if !*quiet || strings.HasPrefix(format, "WARNING") {
+			fmt.Fprintf(stderr, "servatum: "+format+"\n", a...)
+		}
+	}
+	client := api.New(*endpoint, *key, version)
+	if !*dry {
+		flushSpool(client, logf, 10*time.Second)
+	}
+	return deliver(client, r, *dry, stderr, logf)
 }
