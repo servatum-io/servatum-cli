@@ -37,3 +37,21 @@ Generic POSIX `sh` scripts for Linux servers. Key goes in `/etc/servatum/env` (`
 | `log-check.sh <job> <log> [--ok RE] [--fail RE] [--max-age MIN]` | the tool only writes a log | `30 6 * * * log-check.sh job_x /var/log/backup.log` |
 
 `servatum report --job … --status ok|warn|fail [--exit-code N] [--message …]` is what the hooks call; use it directly from any script.
+
+## cPanel & WHM backups
+
+Registers a [Standardized Hook](https://api.docs.cpanel.net/guides/guide-to-standardized-hooks/) on `System::Backup` (`pre` + `post`, runs as root, cannot block the backup). Run as root on the cPanel server:
+
+```sh
+install -m 755 servatum-linux-amd64 /usr/local/servatum/servatum
+SERVATUM_KEY=sv_ing_... /usr/local/servatum/servatum install whm --job job_...   # add --dry-run to only log
+/usr/local/cpanel/bin/manage_hooks list | grep -A4 whm-backup                     # check
+/usr/local/servatum/servatum uninstall whm                                        # remove
+```
+
+- `pre` records the start and sends `started`. `post` checks the run and sends `ok` / `warn` / `fail`, logging to `/var/log/servatum-whm.log`.
+- What is checked: backup settings and accounts from WHM API 1 (`backup_config_get`, `listaccts`: accounts with backups off, and suspended accounts when those are excluded, are not expected); the run's archives under `<backupdir>/YYYY-MM-DD`, `weekly/…`, `monthly/…` (`accounts/<user>.tar.gz|.tar|<user>/`).
+- `fail`: no backup directory for the run, no archives, an expected account missing, or a sampled archive that does not open. `warn`: an archive under 10 KB, or the sample check ran out of time.
+- Test-read: 3 random archives (max 5% of them, at least 1), read end to end, 120 s cap (`--sample`, `--sample-max-pct`, `--verify-timeout`). Incremental (directory) backups are not test-read.
+- The report carries `kind: whm.backup.v1` and a `details` object; the problem list is capped at 100 entries to stay under the 16 KB body limit.
+- Try it without a hook: `servatum whm report --dry-run --day 2026-11-08`.

@@ -48,6 +48,10 @@ type Run struct {
 	Retention      *Retention `json:"retention,omitempty"`
 	Message        string     `json:"message,omitempty"`
 	IdempotencyKey string     `json:"idempotency_key,omitempty"`
+	// Kind names the integration that built Details, versioned
+	// (e.g. "whm.backup.v1"). Both are optional; plain reports omit them.
+	Kind    string          `json:"kind,omitempty"`
+	Details json.RawMessage `json:"details,omitempty"`
 }
 
 type RunResponse struct {

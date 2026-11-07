@@ -47,6 +47,12 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 		return cmdReport(args[1:], stderr)
 	case "flush":
 		return cmdFlush(args[1:], stderr)
+	case "whm":
+		return cmdWHM(args[1:], whmStdin, stderr)
+	case "install":
+		return cmdInstall(args[1:], stderr)
+	case "uninstall":
+		return cmdUninstall(args[1:], stderr)
 	case "version", "--version", "-v":
 		fmt.Fprintln(stdout, "servatum", version)
 		return 0
@@ -65,6 +71,9 @@ func usage(w io.Writer) {
   servatum ping [--start|--fail] [--log FILE|-] <ping_token>
   servatum report --job job_… --status ok|warn|fail [--message …]
   servatum flush                 send reports spooled while Servatum was unreachable
+  servatum whm start|report|hook cPanel/WHM backup checks (see README)
+  servatum install whm --job …   register the WHM backup hook (root)
+  servatum uninstall whm         remove it
   servatum version
 
 Environment: SERVATUM_KEY (ingest key), SERVATUM_JOB, SERVATUM_ENDPOINT, SERVATUM_SPOOL
