@@ -55,7 +55,9 @@ func TestProbeNoLocalSets(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "offsite_sync.sh")
 	_ = os.WriteFile(script, []byte("#!/bin/bash\nBACKUP_DIR=\""+root+"\"\nrclone sync ...\n"), 0o700)
 	_ = os.WriteFile(filepath.Join(cron, "helper"), []byte("MAILTO=root\n30 2 * * * root rm -rf "+root+"/old\n"), 0o600)
-	crontab := "0 1 * * * " + script + " >/dev/null 2>&1\n0 0 * * * /usr/local/cpanel/bin/backup\n15 * * * * /bin/true\n"
+	crontab := "0 1 * * * " + script + " >/dev/null 2>&1\n0 0 * * * /usr/local/cpanel/bin/backup\n15 * * * * /bin/true\n" +
+		"*/15 * * * * /usr/bin/python3 /opt/scripts" + root + "/status.py build\n" + // path merely contains the dir name
+		"5 * * * * /usr/bin/python3 -u " + script + "\n" // interpreter + script
 
 	base := FakeExec(root)
 	x := func(name string, args ...string) ([]byte, error) {
@@ -80,11 +82,14 @@ func TestProbeNoLocalSets(t *testing.T) {
 	if strings.Join(p.Accounts.BackupOff, ",") != "dave" || p.Accounts.SuspendedExcluded != 1 {
 		t.Fatalf("accounts=%+v", p.Accounts)
 	}
-	if len(p.Cron) != 2 || p.Cron[0].Command != script || p.Cron[0].Why != "script mentions the backup dir" || p.Cron[0].Schedule != "0 1 * * *" {
+	if len(p.Cron) != 3 || p.Cron[0].Command != script || p.Cron[0].Why != "script mentions the backup dir" || p.Cron[0].Schedule != "0 1 * * *" {
 		t.Fatalf("cron=%+v", p.Cron)
 	}
-	if p.Cron[1].Schedule != "30 2 * * *" || p.Cron[1].Command != "rm" {
-		t.Fatalf("cron.d=%+v", p.Cron[1])
+	if p.Cron[1].Command != script || p.Cron[1].Schedule != "5 * * * *" {
+		t.Fatalf("interpreter line=%+v", p.Cron[1])
+	}
+	if p.Cron[2].Schedule != "30 2 * * *" || p.Cron[2].Command != "rm" || p.Cron[2].Why != "line mentions the backup dir" {
+		t.Fatalf("cron.d=%+v", p.Cron[2])
 	}
 	joined := strings.Join(p.Hints, " | ")
 	if !strings.Contains(joined, "something removes them") || !strings.Contains(joined, script) || !strings.Contains(joined, "/opt/other/backup-notify") {
@@ -92,5 +97,21 @@ func TestProbeNoLocalSets(t *testing.T) {
 	}
 	if p.Disk == nil || p.Disk.TotalBytes == 0 {
 		t.Fatal("no disk info")
+	}
+}
+
+func TestMentionsDir(t *testing.T) {
+	for s, want := range map[string]bool{
+		"rsync /backup/ x":                   true,
+		`BACKUP_DIR="/backup"`:               true,
+		"BACKUP_DIR=/backup":                 true,
+		"ls /backup":                         true,
+		"/opt/scripts/backup/offsite_sync.sh": false,
+		"/usr/bin/python3 /root/backup/b.py": false,
+		"find /backupx":                      false,
+	} {
+		if got := mentionsDir(s, "/backup"); got != want {
+			t.Errorf("%q: got %v", s, got)
+		}
 	}
 }

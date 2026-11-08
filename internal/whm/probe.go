@@ -323,14 +323,14 @@ func findCron(x Exec, backupDir string) []CronRef {
 				continue
 			}
 			cmd := strings.Join(f[skip:], " ")
-			bin := f[skip]
+			bin := cronScript(f[skip:])
 			if strings.Contains(cmd, "/usr/local/cpanel/bin/backup") {
 				continue // cPanel's own backup run
 			}
 			why := ""
 			if mentionsDir(cmd, backupDir) {
 				why = "line mentions the backup dir"
-			} else if scriptMentions(bin, backupDir) {
+			} else if !systemPath(bin) && scriptMentions(bin, backupDir) {
 				why = "script mentions the backup dir"
 			}
 			if why != "" {
@@ -357,10 +357,38 @@ func boolInt(b bool) int {
 	return 0
 }
 
+// mentionsDir is true when dir appears as a path of its own: /backup or
+// /backup/x, but not /opt/scripts/backup/x.
 func mentionsDir(s, dir string) bool {
 	d := strings.TrimRight(dir, "/")
-	re := regexp.MustCompile(regexp.QuoteMeta(d) + `(["'/\s]|$)`)
+	re := regexp.MustCompile(`(^|[\s"'=:(])` + regexp.QuoteMeta(d) + `(["'/\s);]|$)`)
 	return re.MatchString(s)
+}
+
+var interpreters = map[string]bool{"sh": true, "bash": true, "python": true, "python3": true, "perl": true, "php": true, "env": true}
+
+// cronScript picks the script a cron command runs: the first word, or the
+// first non-flag argument after an interpreter.
+func cronScript(words []string) string {
+	for i, w := range words {
+		if i == 0 && !interpreters[filepath.Base(w)] {
+			return w
+		}
+		if i > 0 && !strings.HasPrefix(w, "-") && !interpreters[filepath.Base(w)] {
+			return w
+		}
+	}
+	return ""
+}
+
+// System binaries are never someone's backup post-processing.
+func systemPath(p string) bool {
+	for _, d := range []string{"/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/local/cpanel/"} {
+		if strings.HasPrefix(p, d) {
+			return true
+		}
+	}
+	return false
 }
 
 func scriptMentions(path, dir string) bool {
