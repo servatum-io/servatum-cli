@@ -47,11 +47,13 @@ install -m 755 servatum-linux-amd64 /usr/local/servatum/servatum
 SERVATUM_KEY=sv_ing_... /usr/local/servatum/servatum install whm --job job_...   # add --dry-run to only log
 /usr/local/cpanel/bin/manage_hooks list | grep -A4 whm-backup                     # check
 /usr/local/servatum/servatum uninstall whm                                        # remove
+/usr/local/servatum/servatum whm probe [--json]                                    # what the setup looks like (read-only)
 ```
 
-- `pre` records the start and sends `started`. `post` checks the run and sends `ok` / `warn` / `fail`, logging to `/var/log/servatum-whm.log`.
-- What is checked: backup settings and accounts from WHM API 1 (`backup_config_get`, `listaccts`: accounts with backups off, and suspended accounts when those are excluded, are not expected); the run's archives under `<backupdir>/YYYY-MM-DD`, `weekly/…`, `monthly/…` (`accounts/<user>.tar.gz|.tar|<user>/`).
-- `fail`: no backup directory for the run, no archives, an expected account missing, or a sampled archive that does not open. `warn`: an archive under 10 KB, or the sample check ran out of time.
-- Test-read: 3 random archives (max 5% of them, at least 1), read end to end, 120 s cap (`--sample`, `--sample-max-pct`, `--verify-timeout`). Incremental (directory) backups are not test-read.
+- `pre` records the start and sends `started`. `post` returns at once and starts a detached check (cPanel writes the run's final state only after its post hooks return). The check reads the archives first, then waits up to 10 min for `Final state is Backup::…` in `/usr/local/cpanel/logs/cpbackup/`, then sends `ok` / `warn` / `fail`. Everything logs to `/var/log/servatum-whm.log`.
+- What is checked: backup settings and accounts from WHM API 1 (`backup_config_get`, `listaccts`: accounts with backups off, and suspended accounts when those are excluded, are not expected); cPanel's final state; the run's archives under `<backupdir>/YYYY-MM-DD`, `weekly/…`, `monthly/…` (`accounts/<user>.tar.gz|.tar|<user>/`). With no local copy, missing accounts come from `backup_user_list` instead.
+- `fail`: final state other than `Success`; no backup found; expected accounts missing (one line per account, or "no account was backed up"); a sampled archive that does not open. `warn`: an archive under 10 KB, the sample check ran out of time, or no final state appeared within the wait.
+- Test-read: max(3, 5% of archives) chosen at random, read end to end, 120 s cap (`--sample`, `--sample-pct`, `--verify-timeout`). Incremental (directory) backups are not test-read.
+- `whm probe` (also printed by `install whm`): backup settings, remote destinations, included/excluded accounts, backup sets found on disk, last runs, other backup hooks, cron jobs that touch the backup dir, free space, and contradictions such as "cPanel keeps local copies but none are on disk".
 - The report carries `kind: whm.backup.v1` and a `details` object; the problem list is capped at 100 entries to stay under the 16 KB body limit.
 - Try it without a hook: `servatum whm report --dry-run --day 2026-11-08`.

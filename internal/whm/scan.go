@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -102,9 +103,10 @@ type VerifyResult struct {
 }
 
 // Verify reads a random sample of archives end to end (gzip + tar framing),
-// proving they open. n is capped by maxPct of the archives (at least 1) and
-// the whole pass by ctx. Running out of time is "incomplete", not a failure.
-func Verify(ctx context.Context, archives map[string]Archive, n int, maxPct float64, rng *rand.Rand) VerifyResult {
+// proving they open. Sample size = max(n, pct% of the archives, rounded up),
+// never more than there are; the whole pass is bounded by ctx. Running out of
+// time is "incomplete", not a failure.
+func Verify(ctx context.Context, archives map[string]Archive, n int, pct float64, rng *rand.Rand) VerifyResult {
 	start := time.Now()
 	var res VerifyResult
 	var pool []Archive
@@ -116,11 +118,8 @@ func Verify(ctx context.Context, archives map[string]Archive, n int, maxPct floa
 		pool = append(pool, a)
 	}
 	sort.Slice(pool, func(i, j int) bool { return pool[i].User < pool[j].User })
-	if cap := int(float64(len(pool)) * maxPct / 100); n > cap {
-		n = cap
-		if n < 1 && len(pool) > 0 {
-			n = 1
-		}
+	if p := int(math.Ceil(float64(len(pool)) * pct / 100)); p > n {
+		n = p
 	}
 	if n > len(pool) {
 		n = len(pool)

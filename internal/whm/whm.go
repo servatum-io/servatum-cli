@@ -133,3 +133,23 @@ func Expected(cfg Config, accts []Account) []string {
 	}
 	return out
 }
+
+// BackupUserList returns each user's backup status for a backup date
+// (active | inactive | no_backup), per WHM API 1 backup_user_list.
+func BackupUserList(x Exec, day string) (map[string]string, error) {
+	d, err := call(x, "backup_user_list", "restore_point="+day+"T00:00:00.000Z")
+	if err != nil {
+		return nil, err
+	}
+	var w struct {
+		U []struct{ Username, Status string } `json:"user"`
+	}
+	if err := json.Unmarshal(d, &w); err != nil {
+		return nil, fmt.Errorf("backup_user_list: %w", err)
+	}
+	out := map[string]string{}
+	for _, u := range w.U {
+		out[u.Username] = u.Status
+	}
+	return out, nil
+}

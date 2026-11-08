@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/servatum-io/servatum-cli/internal/whm"
 )
 
 func fakeWHM(t *testing.T, backupDir string) *[]string {
@@ -61,16 +63,35 @@ func TestWHMHookPrePost(t *testing.T) {
 	writeTgz(t, filepath.Join(acc, "alice.tar.gz"))
 	writeTgz(t, filepath.Join(acc, "bob.tar.gz"))
 
+	logDir := t.TempDir()
+	oldLog := whm.LogDir
+	whm.LogDir = logDir
+	t.Cleanup(func() { whm.LogDir = oldLog })
+	var spawned []string
+	whmSpawn = func(args []string) error { spawned = args; return nil }
+	whmSleep = func(time.Duration) {}
+	t.Cleanup(func() { whmSpawn = spawnDetached; whmSleep = time.Sleep })
+
 	whmStdin = strings.NewReader(`{"context":{"category":"System","event":"Backup","stage":"pre"},"data":{},"hook":{"stage":"pre"}}`)
 	if c, _, e := run("whm", "hook", "--job", "job_w"); c != 0 {
 		t.Fatalf("pre code=%d %s", c, e)
 	}
 	whmNow = func() time.Time { return start.Add(42 * time.Minute) }
 	whmStdin = strings.NewReader(`{"context":{"category":"System","event":"Backup","stage":"post"},"data":{},"hook":{"stage":"post"}}`)
-	if c, _, e := run("whm", "hook", "--job", "job_w"); c != 0 {
+	if c, _, e := run("whm", "hook", "--job", "job_w"); c != 0 || !strings.Contains(e, "started in the background") {
 		t.Fatalf("post code=%d %s", c, e)
 	}
 	whmStdin = os.Stdin
+	if strings.Join(spawned, " ") != "whm report --wait-log 10m --job job_w" {
+		t.Fatalf("spawned %v", spawned)
+	}
+	// what the detached process does, run in-process: cPanel writes its final state
+	logf := filepath.Join(logDir, "1.log")
+	_ = os.WriteFile(logf, []byte("info [backup] Final state is Backup::Success (0)\n"), 0o600)
+	_ = os.Chtimes(logf, start.Add(43*time.Minute), start.Add(43*time.Minute))
+	if c, _, e := run(spawned...); c != 0 {
+		t.Fatalf("report code=%d %s", c, e)
+	}
 	runs, _ := m.Snapshot()
 	if len(runs) != 2 || runs[0]["status"] != "started" || runs[1]["status"] != "ok" {
 		t.Fatalf("runs=%v", runs)
@@ -83,7 +104,10 @@ func TestWHMHookPrePost(t *testing.T) {
 	if d["accounts_expected"].(float64) != 2 || d["archives"].(float64) != 2 {
 		t.Fatalf("details=%v", d)
 	}
-	if v := d["verify"].(map[string]any); v["ok"].(float64) != 1 { // 5% of 2 -> floor 1
+	if d["final_state"] != "Success" || !strings.Contains(r["message"].(string), "cPanel: Success") {
+		t.Fatalf("run=%v", r)
+	}
+	if v := d["verify"].(map[string]any); v["ok"].(float64) != 2 { // max(3, 5%) capped at 2 archives
 		t.Fatalf("verify=%v", v)
 	}
 }
@@ -91,12 +115,15 @@ func TestWHMHookPrePost(t *testing.T) {
 func TestWHMReportMissedRun(t *testing.T) {
 	m, _ := setup(t)
 	t.Setenv("SERVATUM_STATE", t.TempDir())
-	fakeWHM(t, t.TempDir()) // empty backup dir: nothing ran
+	fakeWHM(t, t.TempDir()) // empty backup dir: nothing ran; API lookup fails in the fake
+	oldLog := whm.LogDir
+	whm.LogDir = t.TempDir()
+	t.Cleanup(func() { whm.LogDir = oldLog })
 	if c, _, e := run("whm", "report", "--job", "job_w", "--day", "2026-11-08"); c != 0 {
 		t.Fatalf("code=%d %s", c, e)
 	}
 	runs, _ := m.Snapshot()
-	if len(runs) != 1 || runs[0]["status"] != "fail" || !strings.Contains(runs[0]["message"].(string), "no backup directory") {
+	if len(runs) != 1 || runs[0]["status"] != "fail" || !strings.Contains(runs[0]["message"].(string), "no backup found") {
 		t.Fatalf("runs=%v", runs)
 	}
 }
@@ -106,6 +133,9 @@ func TestWHMDryRunSendsNothing(t *testing.T) {
 	t.Setenv("SERVATUM_STATE", t.TempDir())
 	t.Setenv("SERVATUM_DRY_RUN", "1")
 	fakeWHM(t, t.TempDir())
+	oldLog := whm.LogDir
+	whm.LogDir = t.TempDir()
+	t.Cleanup(func() { whm.LogDir = oldLog })
 	c, _, e := run("whm", "report", "--day", "2026-11-08")
 	if c != 0 || !strings.Contains(e, `"kind": "whm.backup.v1"`) {
 		t.Fatalf("code=%d stderr=%s", c, e)

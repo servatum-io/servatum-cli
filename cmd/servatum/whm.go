@@ -19,8 +19,10 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/servatum-io/servatum-cli/internal/api"
@@ -36,7 +38,31 @@ var (
 	whmLogFile            = "/var/log/servatum-whm.log"
 	whmNow                = time.Now
 	whmStdin    io.Reader = os.Stdin
+	whmSleep              = time.Sleep
+	whmStdout   io.Writer = os.Stdout
+	whmSpawn              = spawnDetached
 )
+
+// spawnDetached starts this binary again in its own session, logging to
+// whmLogFile, and does not wait for it.
+func spawnDetached(args []string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(whmLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	cmd := exec.Command(self, args...)
+	cmd.Stdout, cmd.Stderr = out, out
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
+}
 
 func whmStateFile() string {
 	if d := os.Getenv("SERVATUM_STATE"); d != "" {
@@ -47,7 +73,7 @@ func whmStateFile() string {
 
 func cmdWHM(args []string, stdin io.Reader, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: servatum whm start|report|hook [flags]")
+		fmt.Fprintln(stderr, "usage: servatum whm start|report|hook|probe [flags]")
 		return 2
 	}
 	switch args[0] {
@@ -57,6 +83,8 @@ func cmdWHM(args []string, stdin io.Reader, stderr io.Writer) int {
 		return whmReport(args[1:], stderr)
 	case "hook":
 		return whmHook(args[1:], stdin, stderr)
+	case "probe":
+		return whmProbe(args[1:], stderr)
 	}
 	fmt.Fprintf(stderr, "servatum whm: unknown command %q\n", args[0])
 	return 2
@@ -122,9 +150,10 @@ func whmReport(args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("whm report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	c := whmFlags(fs)
-	sample := fs.Int("sample", 3, "archives to test-read (0 = off)")
-	maxPct := fs.Float64("sample-max-pct", 5, "never test-read more than this % of archives (min 1)")
+	sample := fs.Int("sample", 3, "archives to test-read at least (0 with --sample-pct 0 = off)")
+	pct := fs.Float64("sample-pct", 5, "test-read at least this % of archives (rounded up)")
 	vtimeout := fs.Duration("verify-timeout", 120*time.Second, "time cap for the test-read pass")
+	waitLog := fs.Duration("wait-log", 0, "wait up to this long for cPanel's run log to show its final state (the hook uses 10m)")
 	day := fs.String("day", "", "backup date YYYY-MM-DD; default the recorded start date, else today")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -162,7 +191,11 @@ func whmReport(args []string, stderr io.Writer) int {
 	}
 	r.IdempotencyKey = fmt.Sprintf("%s-%s-%d", *c.job, host, keyTime.Unix())
 
-	res, err := whmCheck(runDay, *sample, *maxPct, *vtimeout)
+	since := now.Add(-24 * time.Hour)
+	if !started.IsZero() {
+		since = started.Add(-time.Minute)
+	}
+	res, err := whmCheck(runDay, since, *sample, *pct, *vtimeout, *waitLog)
 	if err != nil {
 		r.Status, r.Message = api.StatusFail, "could not read the WHM backup state: "+err.Error()
 	} else {
@@ -181,7 +214,10 @@ func whmReport(args []string, stderr io.Writer) int {
 	return 0
 }
 
-func whmCheck(day time.Time, sample int, maxPct float64, vtimeout time.Duration) (whm.Result, error) {
+// whmCheck reads the run's archives first (before anything can move them),
+// then, if asked, waits for cPanel's final state, and only then asks the API
+// about accounts when no local set exists.
+func whmCheck(day, since time.Time, sample int, pct float64, vtimeout, waitLog time.Duration) (whm.Result, error) {
 	cfg, err := whm.GetConfig(whmExec)
 	if err != nil {
 		return whm.Result{}, err
@@ -190,19 +226,31 @@ func whmCheck(day time.Time, sample int, maxPct float64, vtimeout time.Duration)
 	if err != nil {
 		return whm.Result{}, err
 	}
-	dirs := whm.RunDirs(cfg.BackupDir, day)
-	archives, err := whm.Scan(dirs)
-	if err != nil {
+	in := whm.Input{Cfg: cfg, Expected: whm.Expected(cfg, accts)}
+	in.Dirs = whm.RunDirs(cfg.BackupDir, day)
+	if in.Archives, err = whm.Scan(in.Dirs); err != nil {
 		return whm.Result{}, err
 	}
-	var v *whm.VerifyResult
-	if sample > 0 && len(archives) > 0 {
+	if (sample > 0 || pct > 0) && len(in.Archives) > 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), vtimeout)
-		defer cancel()
-		vr := whm.Verify(ctx, archives, sample, maxPct, rand.New(rand.NewSource(whmNow().UnixNano())))
-		v = &vr
+		vr := whm.Verify(ctx, in.Archives, sample, pct, rand.New(rand.NewSource(whmNow().UnixNano())))
+		cancel()
+		in.Verify = &vr
 	}
-	return whm.Evaluate(cfg, whm.Expected(cfg, accts), dirs, archives, v), nil
+	var ls whm.LogState
+	if waitLog > 0 {
+		in.WaitedLog = true
+		ls, _ = whm.WaitFinal(whm.LogDir, since, whmNow().Add(waitLog), 15*time.Second, whmNow, whmSleep)
+	} else {
+		ls, _ = whm.LatestLog(whm.LogDir, since)
+	}
+	in.FinalState = ls.State
+	if len(in.Dirs) == 0 {
+		if us, err := whm.BackupUserList(whmExec, day.Format("2006-01-02")); err == nil {
+			in.UserStatus = us
+		}
+	}
+	return whm.Evaluate(in), nil
 }
 
 // whmHook is what cPanel runs. It reads the event JSON from stdin (the docs
@@ -225,7 +273,14 @@ func whmHook(args []string, stdin io.Reader, stderr io.Writer) int {
 	case "pre":
 		return whmStart(args, stderr)
 	case "post":
-		return whmReport(args, stderr)
+		// cPanel writes the run's final state only after its post hooks
+		// return, so the check runs detached and waits for it.
+		if err := whmSpawn(append([]string{"whm", "report", "--wait-log", "10m"}, args...)); err != nil {
+			fmt.Fprintf(stderr, "servatum: WARNING could not start the detached check (%v); checking now without the final state\n", err)
+			return whmReport(args, stderr)
+		}
+		fmt.Fprintln(stderr, "servatum: post-backup check started in the background")
+		return 0
 	}
 	fmt.Fprintf(stderr, "servatum: WARNING unknown hook stage %q; nothing done\n", stage)
 	return 0
@@ -291,7 +346,8 @@ func cmdInstall(args []string, stderr io.Writer) int {
 			return 1
 		}
 	}
-	fmt.Fprintf(stderr, "servatum: WHM hook installed (%s, System::Backup pre+post, dry-run=%v)\n", hookPath(), *dry)
+	fmt.Fprintf(stderr, "servatum: WHM hook installed (%s, System::Backup pre+post, dry-run=%v)\n\n", hookPath(), *dry)
+	printProbe(stderr, whm.RunProbe(whmExec, whmNow()))
 	return 0
 }
 
@@ -338,4 +394,63 @@ func writeEnv(path string, set map[string]string) error {
 		return err
 	}
 	return os.Chmod(path, 0o600)
+}
+
+func whmProbe(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("whm probe", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	asJSON := fs.Bool("json", false, "print the facts as JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	p := whm.RunProbe(whmExec, whmNow())
+	if *asJSON {
+		b, _ := json.MarshalIndent(p, "", "  ")
+		fmt.Fprintln(whmStdout, string(b))
+		return 0
+	}
+	printProbe(whmStdout, p)
+	return 0
+}
+
+// printProbe is the "here is what we found" summary the wizard will show.
+func printProbe(w io.Writer, p whm.Probe) {
+	c := p.Config
+	on := map[bool]string{true: "on", false: "off"}
+	fmt.Fprintln(w, "What this server's cPanel backup looks like:")
+	fmt.Fprintf(w, "  Backups:       %s, %s, in %s\n", on[c.Enabled], orDash(c.Type), orDash(c.Dir))
+	fmt.Fprintf(w, "  Schedule:      daily %s (days %s), weekly %s, monthly %s\n", on[c.Daily], orDash(c.Days), on[c.Weekly], on[c.Monthly])
+	fmt.Fprintf(w, "  Keep local:    %s, retain %d daily\n", on[c.KeepLocal], c.RetainDaily)
+	fmt.Fprintf(w, "  Accounts:      %d of %d included", p.Accounts.Included, p.Accounts.Total)
+	if len(p.Accounts.BackupOff) > 0 {
+		fmt.Fprintf(w, " (backups off: %s)", strings.Join(p.Accounts.BackupOff, ", "))
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  Destinations:  %d remote\n", len(p.Destinations))
+	if len(p.LocalSets) == 0 {
+		fmt.Fprintln(w, "  Local sets:    none on disk")
+	} else {
+		ls := p.LocalSets[0]
+		fmt.Fprintf(w, "  Local sets:    %d, latest %s (%s, %d archives, %.1f GB)\n", len(p.LocalSets), ls.Path, ls.Tier, ls.Archives, float64(ls.Bytes)/(1<<30))
+	}
+	if len(p.Logs) > 0 {
+		fmt.Fprintf(w, "  Last run:      %s, %s\n", p.Logs[0].At.Local().Format("2006-01-02 15:04"), orDash(p.Logs[0].State))
+	}
+	for _, k := range p.Hooks {
+		if !k.Ours {
+			fmt.Fprintf(w, "  Other hook:    %s::%s %s → %s\n", k.Category, k.Event, k.Stage, k.Hook)
+		}
+	}
+	for _, r := range p.Cron {
+		fmt.Fprintf(w, "  Cron:          %s %s (%s)\n", r.Schedule, r.Command, r.Why)
+	}
+	if p.Disk != nil {
+		fmt.Fprintf(w, "  Free space:    %.0f GB of %.0f GB\n", float64(p.Disk.FreeBytes)/(1<<30), float64(p.Disk.TotalBytes)/(1<<30))
+	}
+	for _, h := range p.Hints {
+		fmt.Fprintln(w, "  ! "+h)
+	}
+	for _, e := range p.Errors {
+		fmt.Fprintln(w, "  could not read "+e)
+	}
 }
