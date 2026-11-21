@@ -1,6 +1,14 @@
 # servatum-cli
 
-Report backup job results to [Servatum](https://servatum.io).
+The command-line client for [Servatum](https://servatum.io): it reports each backup job's result, from outside the backup tool's own alerts, so a job that fails or never runs is caught.
+
+- **cPanel & WHM:** a `System::Backup` hook that checks every run against cPanel's final state, the expected accounts and a test-read of the archives. This is what the [free beta](https://servatum.io/beta/) covers; see [cPanel Backup monitoring](https://servatum.io/integrations/cpanel-backup/).
+- **Anything else:** wrap a command (`servatum run`), send a heartbeat (`servatum ping`), or report from a post-job hook (`servatum report`). Integrations for other tools are [queued after the beta](https://servatum.io/integrations/).
+- **Docs:** [how reports reach Servatum](https://servatum.io/docs/ingest/). **Live example:** [a real host's backups as Servatum reports them](https://servatum.io/demo/).
+
+Status: pre-release, built alongside the free beta. Binaries are published with the beta; until then, build from source (`make build`, Go 1.24+). Questions: hello@servatum.io.
+
+## Quick start
 
 ```sh
 export SERVATUM_KEY=sv_ing_...        # ingest key (prefer env over --key: flags show in ps)
@@ -57,3 +65,7 @@ SERVATUM_KEY=sv_ing_... /usr/local/servatum/servatum install whm --job job_...  
 - `whm probe` (also printed by `install whm`): backup settings, remote destinations, included/excluded accounts, backup sets found on disk, last runs, other backup hooks, cron jobs that touch the backup dir, free space, and contradictions such as "cPanel keeps local copies but none are on disk".
 - The report carries `kind: whm.backup.v1` and a `details` object; the problem list is capped at 100 entries to stay under the 16 KB body limit.
 - Try it without a hook: `servatum whm report --dry-run --day 2026-11-08`.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
